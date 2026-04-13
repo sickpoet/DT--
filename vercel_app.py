@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import csv
 import io
+import json
+import os
+import time
 from html import escape
-from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 
 import charger_cabinet_planner as planner
+import requests
 
 
 app = FastAPI()
@@ -73,6 +77,89 @@ def read_uploaded_csv(upload: UploadFile) -> list[dict]:
     return rows
 
 
+def kv_is_configured() -> bool:
+    return bool(os.getenv("KV_REST_API_URL")) and bool(os.getenv("KV_REST_API_TOKEN"))
+
+
+def kv_call(command: str, *args: str, body: bytes | None = None, params: dict[str, str] | None = None) -> object | None:
+    url = (os.getenv("KV_REST_API_URL") or "").strip().rstrip("/")
+    token = (os.getenv("KV_REST_API_TOKEN") or "").strip()
+    if not url or not token:
+        return None
+
+    path = "/".join([quote(command.strip().lower(), safe=""), *(quote(str(a), safe="") for a in args)])
+    full_url = f"{url}/{path}"
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        if body is None:
+            resp = requests.get(full_url, headers=headers, params=params, timeout=6)
+        else:
+            resp = requests.post(full_url, headers=headers, params=params, data=body, timeout=6)
+    except Exception:
+        return None
+
+    try:
+        payload = resp.json()
+    except Exception:
+        return None
+
+    if isinstance(payload, dict) and "error" in payload:
+        return None
+    if isinstance(payload, dict) and "result" in payload:
+        return payload.get("result")
+    return None
+
+
+def kv_set_json(key: str, value: object, ex_seconds: int | None = None) -> None:
+    body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    params = {"EX": str(int(ex_seconds))} if ex_seconds else None
+    kv_call("set", key, body=body, params=params)
+
+
+def kv_get_json(key: str) -> object | None:
+    raw = kv_call("get", key)
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def kv_set_text(key: str, value: str, ex_seconds: int | None = None) -> None:
+    body = value.encode("utf-8")
+    params = {"EX": str(int(ex_seconds))} if ex_seconds else None
+    kv_call("set", key, body=body, params=params)
+
+
+def kv_get_text(key: str) -> str | None:
+    raw = kv_call("get", key)
+    if isinstance(raw, str) and raw:
+        return raw
+    return None
+
+
+def kv_lpush_json(list_key: str, value: object, max_len: int = 50) -> None:
+    body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    kv_call("lpush", list_key, body=body)
+    kv_call("ltrim", list_key, "0", str(max_len - 1))
+
+
+def kv_lrange_json(list_key: str, start: int, stop: int) -> list[object]:
+    raw = kv_call("lrange", list_key, str(start), str(stop))
+    if not isinstance(raw, list):
+        return []
+    out: list[object] = []
+    for item in raw:
+        if not isinstance(item, str) or not item:
+            continue
+        try:
+            out.append(json.loads(item))
+        except Exception:
+            continue
+    return out
+
+
 @app.get("/", response_class=HTMLResponse)
 def home(query: str | None = None, qid: str | None = None, pop: str | None = None, include_subdiv: int = 0):
     query_val = (query or "").strip()
@@ -98,6 +185,29 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
 """.format(query=escape(query_val))
 
     if not query_val:
+        if kv_is_configured():
+            items = kv_lrange_json("history:queries", 0, 9)
+            if items:
+                links: list[str] = []
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    item_qid = str(it.get("qid") or "").strip()
+                    item_name = str(it.get("name") or "").strip()
+                    item_pop = it.get("population")
+                    if not item_qid or not item_name:
+                        continue
+                    if isinstance(item_pop, int) and item_pop > 0:
+                        pop_param = f"&pop={quote(str(item_pop), safe='')}"
+                    else:
+                        pop_param = ""
+                    links.append(
+                        f"<div><a href='/?query={quote(item_name, safe='')}&qid={quote(item_qid, safe='')}{pop_param}'>"
+                        f"{escape(item_name)} <span class='muted'>({escape(item_qid)})</span>"
+                        f"</a></div>"
+                    )
+                if links:
+                    body += "<div class='card'><div><b>最近查询</b></div><div style='margin-top:10px;'>" + "".join(links) + "</div></div>"
         return html_page("共享充电宝投放分析工具", body)
 
     candidates = []
@@ -174,11 +284,18 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
         body += "<div class='card error'>无法自动获取该地区人口，请手动输入人口数。</div>"
         return html_page("共享充电宝投放分析工具", body)
 
-    plan = planner.plan_for_area(name, int(population))
+    population_int = int(population)
+    cache_key = f"calc:{selected_qid}:{population_int}:{planner.PEOPLE_PER_CABINET}:{planner.CABINETS_PER_AGENT}"
+    cached = kv_get_json(cache_key) if kv_is_configured() else None
+    if isinstance(cached, dict) and cached.get("qid") == selected_qid and cached.get("population") == population_int:
+        plan = planner.plan_for_area(str(cached.get("name") or name), population_int)
+    else:
+        plan = planner.plan_for_area(name, population_int)
     rows = [
         {
             "地区": plan.name,
             "人口(万)": f"{plan.population / 10_000:.2f}",
+            "柜机数": f"{plan.cabinets_needed}",
             "柜机数": f"{plan.cabinets_needed}",
             "代理名额": f"{plan.agent_slots}",
             "_qid": selected_qid,
@@ -209,6 +326,29 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
                 }
             )
 
+    if kv_is_configured():
+        ts = int(time.time())
+        kv_set_json(
+            cache_key,
+            {
+                "qid": selected_qid,
+                "name": plan.name,
+                "population": plan.population,
+                "cabinets": plan.cabinets_needed,
+                "agents": plan.agent_slots,
+                "people_per_cabinet": planner.PEOPLE_PER_CABINET,
+                "cabinets_per_agent": planner.CABINETS_PER_AGENT,
+                "include_subdiv": include_subdiv,
+                "ts": ts,
+            },
+            ex_seconds=60 * 60 * 24 * 30,
+        )
+        kv_lpush_json(
+            "history:queries",
+            {"qid": selected_qid, "name": plan.name, "population": plan.population, "ts": ts},
+            max_len=60,
+        )
+
     body += f"""
 <div class="card">
   <div class="ok"><b>测算结果</b></div>
@@ -219,7 +359,7 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
   </div>
   <div style="margin-top:12px;">{render_table(rows)}</div>
   <div style="margin-top:12px;">
-    <a href="/report?qid={escape(selected_qid)}&name={escape(plan.name)}&pop={escape(str(plan.population))}">生成简报</a>
+    <a href="/report?qid={quote(selected_qid, safe='')}&name={quote(plan.name, safe='')}&pop={quote(str(plan.population), safe='')}">生成简报</a>
   </div>
 </div>
 """
@@ -228,13 +368,23 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
 
 @app.get("/report", response_class=PlainTextResponse)
 def report(qid: str, name: str, pop: int):
+    qid = (qid or "").strip()
+    name = (name or "").strip()
+    pop = int(pop)
+    report_key = f"report:{qid}:{pop}:{planner.PEOPLE_PER_CABINET}:{planner.CABINETS_PER_AGENT}"
+    if kv_is_configured():
+        cached = kv_get_text(report_key)
+        if cached:
+            return cached
     entity = None
     try:
         entity = planner.wikidata_first_entity(qid, language=planner.WIKIDATA_LANG)
     except Exception:
         entity = None
-    plan = planner.plan_for_area(name, int(pop))
+    plan = planner.plan_for_area(name, pop)
     text = planner.build_area_report(plan=plan, qid=qid, entity=entity)
+    if kv_is_configured() and text:
+        kv_set_text(report_key, text, ex_seconds=60 * 60 * 24 * 30)
     return text
 
 

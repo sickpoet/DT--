@@ -156,9 +156,8 @@ with tab1:
 
         st.divider()
         
-        # 人口输入
         pop_input = st.text_input("👥 人口数量", placeholder="例如 100万、350000 (留空则尝试自动查询)")
-        
+        st.checkbox("测算后自动生成简报（右侧）", value=True, key="auto_report_after_calc")
         calc_btn = st.button("🚀 开始分析测算", type="primary", use_container_width=True)
 
     with col2:
@@ -185,6 +184,12 @@ with tab1:
                     st.session_state["calc_parent"] = {"name": plan.name, "qid": qid, "population": int(population)}
                     st.session_state.pop("last_report", None)
                     st.session_state.pop("last_report_name", None)
+                    if bool(st.session_state.get("auto_report_after_calc", True)):
+                        entity = cached_wikidata_first_entity(str(qid)) if qid else None
+                        with st.spinner("⏳ 正在生成简报..."):
+                            report = planner.build_area_report(plan, str(qid), entity)
+                        st.session_state["last_report"] = report
+                        st.session_state["last_report_name"] = plan.name
                 except Exception as e:
                     import traceback
 
@@ -201,67 +206,71 @@ with tab1:
         plan = planner.plan_for_area(str(parent.get("name") or "未命名地区"), population)
         qid = str(parent.get("qid") or "")
 
-        st.subheader("📊 核心测算结果")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("👥 人口总数(万)", f"{format_population_wan(population)}")
-        m2.metric("🔋 建议柜机数", f"{plan.cabinets_needed:,}")
-        m3.metric("🤝 代理名额", f"{plan.agent_slots:,}")
+        left, right = st.columns([1.35, 1])
 
-        st.divider()
+        with left:
+            st.subheader("📊 核心测算结果")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("👥 人口总数(万)", f"{format_population_wan(population)}")
+            m2.metric("🔋 建议柜机数", f"{plan.cabinets_needed:,}")
+            m3.metric("🤝 代理名额", f"{plan.agent_slots:,}")
 
-        st.subheader("🏘️ 本地区 & 下一级行政区划测算表")
-        df = build_plans_table(rows).drop(columns=["_qid"], errors="ignore").sort_values(by="人口(万)", ascending=False)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        st.download_button(
-            "📥 下载测算表 (CSV)",
-            df.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"{plan.name}_测算表.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+            st.divider()
 
-        st.divider()
-
-        st.subheader("📝 生成详细分析简报")
-        options = {r["地区"]: r for r in rows if r.get("地区")}
-        option_names = list(options.keys())
-        default_idx = 0
-        if plan.name in option_names:
-            default_idx = option_names.index(plan.name)
-        target_name = st.selectbox("选择要生成简报的地区", option_names, index=default_idx, key="report_target")
-
-        if st.button("📄 生成分析简报", type="secondary", use_container_width=True):
-            target = options[target_name]
-            target_qid = target.get("_qid")
-            target_pop_wan = target.get("人口(万)")
-            target_pop: int | None = None
-            if isinstance(target_pop_wan, (int, float)):
-                target_pop = int(round(float(target_pop_wan) * 10_000))
-            if (target_pop is None or target_pop <= 0) and target_qid:
-                fetched = cached_wikidata_population(str(target_qid))
-                if fetched is not None:
-                    target_pop = int(fetched)
-            if target_pop is None or target_pop <= 0:
-                st.error("❌ 该地区人口缺失，无法生成简报（请先补齐人口或换一个地区）")
-                st.stop()
-            target_plan = planner.plan_for_area(target_name, int(target_pop))
-            entity = cached_wikidata_first_entity(str(target_qid)) if target_qid else None
-            with st.spinner("⏳ 正在生成简报..."):
-                report = planner.build_area_report(target_plan, str(target_qid) if target_qid else None, entity)
-            st.session_state["last_report"] = report
-            st.session_state["last_report_name"] = target_name
-
-        report = st.session_state.get("last_report")
-        report_name = st.session_state.get("last_report_name") or target_name
-        if report:
-            st.text_area("分析结果", value=report, height=420)
+            st.subheader("🏘️ 本地区 & 下一级行政区划测算表")
+            df = build_plans_table(rows).drop(columns=["_qid"], errors="ignore").sort_values(by="人口(万)", ascending=False)
+            st.dataframe(df, use_container_width=True, hide_index=True)
             st.download_button(
-                "📥 下载简报文本",
-                report,
-                file_name=f"{report_name}_投放分析报告.txt",
-                mime="text/plain",
+                "📥 下载测算表 (CSV)",
+                df.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"{plan.name}_测算表.csv",
+                mime="text/csv",
                 use_container_width=True,
             )
+
+        with right:
+            st.subheader("📝 生成详细分析简报")
+            options = {r["地区"]: r for r in rows if r.get("地区")}
+            option_names = list(options.keys())
+            default_idx = 0
+            if plan.name in option_names:
+                default_idx = option_names.index(plan.name)
+            target_name = st.selectbox("选择要生成简报的地区", option_names, index=default_idx, key="report_target")
+
+            if st.button("📄 生成/刷新简报", type="secondary", use_container_width=True):
+                target = options[target_name]
+                target_qid = target.get("_qid")
+                target_pop_wan = target.get("人口(万)")
+                target_pop: int | None = None
+                if isinstance(target_pop_wan, (int, float)):
+                    target_pop = int(round(float(target_pop_wan) * 10_000))
+                if (target_pop is None or target_pop <= 0) and target_qid:
+                    fetched = cached_wikidata_population(str(target_qid))
+                    if fetched is not None:
+                        target_pop = int(fetched)
+                if target_pop is None or target_pop <= 0:
+                    st.error("❌ 该地区人口缺失，无法生成简报（请先补齐人口或换一个地区）")
+                    st.stop()
+                target_plan = planner.plan_for_area(target_name, int(target_pop))
+                entity = cached_wikidata_first_entity(str(target_qid)) if target_qid else None
+                with st.spinner("⏳ 正在生成简报..."):
+                    report = planner.build_area_report(target_plan, str(target_qid) if target_qid else None, entity)
+                st.session_state["last_report"] = report
+                st.session_state["last_report_name"] = target_name
+
+            report = st.session_state.get("last_report")
+            report_name = st.session_state.get("last_report_name") or target_name
+            if report:
+                st.text_area("分析结果", value=report, height=520)
+                st.download_button(
+                    "📥 下载简报文本",
+                    report,
+                    file_name=f"{report_name}_投放分析报告.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+            else:
+                st.info("点击“生成/刷新简报”，简报会显示在右侧。")
 
 with tab2:
     st.subheader("📂 批量上传 CSV 文件进行计算")
