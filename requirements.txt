@@ -1,0 +1,6 @@
+streamlit
+pandas
+urllib3
+requests
+fastapi
+python-multipart
