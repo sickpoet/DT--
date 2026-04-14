@@ -17,8 +17,26 @@ import requests
 app = FastAPI()
 
 
+def get_api_connection_status() -> str:
+    """返回API连接状态信息的HTML字符串"""
+    amap_status = "✅ 已连接" if amap_is_configured() else "❌ 未连接"
+    kv_status = "✅ 已连接" if kv_is_configured() else "❌ 未连接"
+    
+    status_html = f"""
+    <div style="background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 8px; padding: 12px; margin-bottom: 20px;">
+      <div style="font-weight: bold; color: #0369a1; margin-bottom: 8px;">API 连接状态</div>
+      <div style="display: flex; gap: 20px; flex-wrap: wrap;">
+        <div>高德API: <span class="{'ok' if amap_is_configured() else 'error'}">{amap_status}</span></div>
+        <div>KV缓存: <span class="{'ok' if kv_is_configured() else 'error'}">{kv_status}</span></div>
+      </div>
+    </div>
+    """
+    return status_html
+
+
 def html_page(title: str, body: str, main_content_style: str = "") -> str:
     safe_title = escape(title)
+    api_status = get_api_connection_status()
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -46,6 +64,7 @@ def html_page(title: str, body: str, main_content_style: str = "") -> str:
 <body>
   <h1>{safe_title}</h1>
   <div class="muted">部署在 Vercel 的轻量版（功能覆盖：搜索/测算/简报）。本地完整版仍用 Streamlit。</div>
+  {api_status}
   <div style="margin-top: 24px; {main_content_style}">
     {body}
   </div>
