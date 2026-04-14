@@ -29,7 +29,7 @@ def html_page(title: str, body: str, main_content_style: str = "") -> str:
     body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial; margin: 24px; }}
     .card {{ border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; margin: 12px 0; }}
     .row {{ display: flex; gap: 12px; flex-wrap: wrap; }}
-    .row > * {{ flex: 1; min-width: 220px; }}
+    .row > * {{ flex: 1; min-width: 320px; }}
     input[type="text"] {{ width: 100%; padding: 10px; border: 1px solid #d1d5db; border-radius: 8px; }}
     button {{ padding: 10px 14px; border: 0; border-radius: 8px; background: #2563eb; color: white; cursor: pointer; }}
     button.secondary {{ background: #111827; }}
@@ -40,13 +40,13 @@ def html_page(title: str, body: str, main_content_style: str = "") -> str:
     .error {{ color: #b91c1c; }}
     .ok {{ color: #047857; }}
     a {{ color: #2563eb; text-decoration: none; }}
-    code, pre {{ background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px; overflow: auto; }}
+    code, pre {{ background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px; overflow: auto; white-space: pre-wrap; word-break: break-all; }}
   </style>
 </head>
 <body>
   <h1>{safe_title}</h1>
   <div class="muted">部署在 Vercel 的轻量版（功能覆盖：搜索/测算/简报）。本地完整版仍用 Streamlit。</div>
-  <div style="{main_content_style}">
+  <div style="margin-top: 24px; {main_content_style}">
     {body}
   </div>
 </body>
@@ -321,7 +321,6 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
             "地区": plan.name,
             "人口(万)": f"{plan.population / 10_000:.2f}",
             "柜机数": f"{plan.cabinets_needed}",
-            "柜机数": f"{plan.cabinets_needed}",
             "代理名额": f"{plan.agent_slots}",
             "_qid": selected_qid,
         }
@@ -414,4 +413,4 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
   <div style="flex:1;">{right_panel_content}</div>
 </div>
 """
-    return html_page("共享充电宝投放分析工具", body, "display: flex; gap: 24px;")
+    return html_page("共享充电宝投放分析工具", body)
