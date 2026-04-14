@@ -16,22 +16,47 @@ import requests
 
 app = FastAPI()
 
+def env_has(name: str) -> bool:
+    return bool((os.getenv(name) or "").strip())
+
+
+def kv_env_probe() -> dict[str, bool]:
+    names = [
+        "KV_REST_API_URL",
+        "KV_REST_API_TOKEN",
+        "KV_REST_API_READ_ONLY_TOKEN",
+        "UPSTASH_REDIS_REST_URL",
+        "UPSTASH_REDIS_REST_TOKEN",
+        "UPSTASH_REDIS_REST_READ_ONLY_TOKEN",
+    ]
+    return {n: env_has(n) for n in names}
+
+
 
 def get_api_connection_status() -> str:
-    """返回API连接状态信息的HTML字符串"""
-    amap_status = "✅ 已连接" if amap_is_configured() else "❌ 未连接"
-    kv_status = "✅ 已连接" if kv_is_configured() else "❌ 未连接"
-    
+    amap_status = "已配置" if amap_is_configured() else "未配置"
+    probe = kv_env_probe()
+    probe_text = " / ".join(
+        [
+            f"KV_URL={'是' if probe['KV_REST_API_URL'] else '否'}",
+            f"KV_TOKEN={'是' if probe['KV_REST_API_TOKEN'] else '否'}",
+            f"KV_RO={'是' if probe['KV_REST_API_READ_ONLY_TOKEN'] else '否'}",
+            f"UP_URL={'是' if probe['UPSTASH_REDIS_REST_URL'] else '否'}",
+            f"UP_TOKEN={'是' if probe['UPSTASH_REDIS_REST_TOKEN'] else '否'}",
+            f"UP_RO={'是' if probe['UPSTASH_REDIS_REST_READ_ONLY_TOKEN'] else '否'}",
+        ]
+    )
+    kv_mode = kv_mode_text()
     status_html = f"""
     <div style="background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 8px; padding: 12px; margin-bottom: 20px;">
       <div style="font-weight: bold; color: #0369a1; margin-bottom: 8px;">API 连接状态</div>
       <div style="display: flex; gap: 20px; flex-wrap: wrap;">
-        <div>高德API: <span class="{'ok' if amap_is_configured() else 'error'}">{amap_status}</span></div>
-        <div>KV缓存: <span class="{'ok' if kv_is_configured() else 'error'}">{kv_status}</span></div>
-      </div>
+        <div>高德行政区划: <span class="{'ok' if amap_is_configured() else 'error'}">{amap_status}</span></div>
+        <div>缓存(Vercel KV/Upstash): <span class="{kv_mode['class']}">{kv_mode['text']}</span></div>
+      <div class="muted" style="margin-top: 8px;">运行时环境变量：<code>{escape(probe_text)}</code></div>
+      <div class="muted" style="margin-top: 8px;">在 Vercel 控制台启用 Storage → KV 并绑定项目后，会自动注入 KV_REST_API_URL / KV_REST_API_TOKEN。</div>
     </div>
     """
-    return status_html
 
 
 def html_page(title: str, body: str, main_content_style: str = "") -> str:
@@ -86,12 +111,57 @@ def render_table(rows: list[dict]) -> str:
 
 
 def kv_is_configured() -> bool:
-    return bool(os.getenv("KV_REST_API_URL")) and bool(os.getenv("KV_REST_API_TOKEN"))
+    return kv_can_read()
+
+
+def kv_rest_url() -> str:
+    for k in ("KV_REST_API_URL", "UPSTASH_REDIS_REST_URL"):
+        v = (os.getenv(k) or "").strip()
+        if v:
+            return v.rstrip("/")
+    return ""
+
+
+def kv_rest_write_token() -> str:
+    for k in ("KV_REST_API_TOKEN", "UPSTASH_REDIS_REST_TOKEN"):
+        v = (os.getenv(k) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def kv_rest_read_token() -> str:
+    for k in (
+        "KV_REST_API_READ_ONLY_TOKEN",
+        "UPSTASH_REDIS_REST_READ_ONLY_TOKEN",
+        "KV_REST_API_TOKEN",
+        "UPSTASH_REDIS_REST_TOKEN",
+    ):
+        v = (os.getenv(k) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def kv_can_read() -> bool:
+    return bool(kv_rest_url()) and bool(kv_rest_read_token())
+
+
+def kv_can_write() -> bool:
+    return bool(kv_rest_url()) and bool(kv_rest_write_token())
+
+
+def kv_mode_text() -> dict[str, str]:
+    if kv_can_write():
+        return {"text": "已配置(读写)", "class": "ok"}
+    if kv_can_read():
+        return {"text": "已配置(只读)", "class": "muted"}
+    return {"text": "未配置(可选)", "class": "muted"}
 
 
 def kv_call(command: str, *args: str, body: bytes | None = None, params: dict[str, str] | None = None) -> object | None:
-    url = (os.getenv("KV_REST_API_URL") or "").strip().rstrip("/")
-    token = (os.getenv("KV_REST_API_TOKEN") or "").strip()
+    url = kv_rest_url()
+    token = kv_rest_read_token()
     if not url or not token:
         return None
 
@@ -119,12 +189,16 @@ def kv_call(command: str, *args: str, body: bytes | None = None, params: dict[st
 
 
 def kv_set_json(key: str, value: object, ex_seconds: int | None = None) -> None:
+    if not kv_can_write():
+        return
     body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     params = {"EX": str(int(ex_seconds))} if ex_seconds else None
     kv_call("set", key, body=body, params=params)
 
 
 def kv_get_json(key: str) -> object | None:
+    if not kv_can_read():
+        return None
     raw = kv_call("get", key)
     if not isinstance(raw, str) or not raw:
         return None
@@ -135,12 +209,16 @@ def kv_get_json(key: str) -> object | None:
 
 
 def kv_set_text(key: str, value: str, ex_seconds: int | None = None) -> None:
+    if not kv_can_write():
+        return
     body = value.encode("utf-8")
     params = {"EX": str(int(ex_seconds))} if ex_seconds else None
     kv_call("set", key, body=body, params=params)
 
 
 def kv_get_text(key: str) -> str | None:
+    if not kv_can_read():
+        return None
     raw = kv_call("get", key)
     if isinstance(raw, str) and raw:
         return raw
@@ -148,12 +226,16 @@ def kv_get_text(key: str) -> str | None:
 
 
 def kv_lpush_json(list_key: str, value: object, max_len: int = 50) -> None:
+    if not kv_can_write():
+        return
     body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     kv_call("lpush", list_key, body=body)
     kv_call("ltrim", list_key, "0", str(max_len - 1))
 
 
 def kv_lrange_json(list_key: str, start: int, stop: int) -> list[object]:
+    if not kv_can_read():
+        return []
     raw = kv_call("lrange", list_key, str(start), str(stop))
     if not isinstance(raw, list):
         return []
