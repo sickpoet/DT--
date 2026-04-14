@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import io
 import json
 import os
@@ -18,7 +17,7 @@ import requests
 app = FastAPI()
 
 
-def html_page(title: str, body: str) -> str:
+def html_page(title: str, body: str, main_content_style: str = "") -> str:
     safe_title = escape(title)
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -46,8 +45,10 @@ def html_page(title: str, body: str) -> str:
 </head>
 <body>
   <h1>{safe_title}</h1>
-  <div class="muted">部署在 Vercel 的轻量版（功能覆盖：搜索/测算/简报/CSV）。本地完整版仍用 Streamlit。</div>
-  {body}
+  <div class="muted">部署在 Vercel 的轻量版（功能覆盖：搜索/测算/简报）。本地完整版仍用 Streamlit。</div>
+  <div style="{main_content_style}">
+    {body}
+  </div>
 </body>
 </html>"""
 
@@ -63,18 +64,6 @@ def render_table(rows: list[dict]) -> str:
         tbody_rows.append(f"<tr>{tds}</tr>")
     tbody = "".join(tbody_rows)
     return f"<table><thead>{thead}</thead><tbody>{tbody}</tbody></table>"
-
-
-def read_uploaded_csv(upload: UploadFile) -> list[dict]:
-    raw = upload.file.read()
-    text = raw.decode("utf-8-sig", errors="replace")
-    f = io.StringIO(text)
-    reader = csv.DictReader(f)
-    rows: list[dict] = []
-    for row in reader:
-        if isinstance(row, dict):
-            rows.append(row)
-    return rows
 
 
 def kv_is_configured() -> bool:
@@ -167,22 +156,16 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
     pop_val = (pop or "").strip()
     include_subdiv = 1 if include_subdiv else 0
 
-    body = """
+    left_panel_content = """
 <div class="card">
-  <div class="row">
-    <form method="get" action="/">
-      <div><b>1) 搜索地区</b></div>
-      <input type="text" name="query" placeholder="例如：永康、北京、杭州西湖区" value="{query}" />
-      <div style="margin-top:10px;"><button type="submit">搜索</button></div>
-    </form>
-    <form method="get" action="/csv">
-      <div><b>批量 CSV</b></div>
-      <div class="muted">跳转到 CSV 上传与批量计算</div>
-      <div style="margin-top:10px;"><button class="secondary" type="submit">打开 CSV 页</button></div>
-    </form>
-  </div>
+  <form method="get" action="/">
+    <div><b>1) 搜索地区</b></div>
+    <input type="text" name="query" placeholder="例如：永康、北京、杭州西湖区" value="{query}" />
+    <div style="margin-top:10px;"><button type="submit">搜索</button></div>
+  </form>
 </div>
 """.format(query=escape(query_val))
+    right_panel_content = ""
 
     if not query_val:
         if kv_is_configured():
@@ -207,7 +190,13 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
                         f"</a></div>"
                     )
                 if links:
-                    body += "<div class='card'><div><b>最近查询</b></div><div style='margin-top:10px;'>" + "".join(links) + "</div></div>"
+                    left_panel_content += "<div class='card'><div><b>最近查询</b></div><div style='margin-top:10px;'>" + "".join(links) + "</div></div>"
+        body = f"""
+<div class="row">
+  <div style="flex:1;">{left_panel_content}</div>
+  <div style="flex:1;">{right_panel_content}</div>
+</div>
+"""
         return html_page("共享充电宝投放分析工具", body)
 
     candidates = []
@@ -218,14 +207,26 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
         error = str(e)
 
     if error:
-        body += f"<div class='card error'>联网搜索失败：{escape(error)}</div>"
+        left_panel_content += f"<div class='card error'>联网搜索失败：{escape(error)}</div>"
+        body = f"""
+<div class="row">
+  <div style="flex:1;">{left_panel_content}</div>
+  <div style="flex:1;'>{right_panel_content}</div>
+</div>
+"""
         return html_page("共享充电宝投放分析工具", body)
 
     if not candidates:
-        body += "<div class='card muted'>未找到匹配项，请换个关键词再试。</div>"
+        left_panel_content += "<div class='card muted'>未找到匹配项，请换个关键词再试。</div>"
+        body = f"""
+<div class="row">
+  <div style="flex:1;">{left_panel_content}</div>
+  <div style="flex:1;'>{right_panel_content}</div>
+</div>
+"""
         return html_page("共享充电宝投放分析工具", body)
 
-    body += """
+    left_panel_content += """
 <div class="card">
   <form method="get" action="/">
     <div><b>2) 选择最匹配项</b></div>
@@ -235,7 +236,7 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
     for idx, c in enumerate(candidates):
         checked = "checked" if (qid_val and c.qid == qid_val) or (not qid_val and idx == 0) else ""
         desc = f" - {c.description}" if c.description else ""
-        body += (
+        left_panel_content += (
             f"<label style='display:block;margin:8px 0;'>"
             f"<input type='radio' name='qid' value='{escape(c.qid)}' {checked} /> "
             f"{escape(c.label)}{escape(desc)} <span class='muted'>({escape(c.qid)})</span>"
@@ -243,7 +244,7 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
         )
 
     checked = "checked" if include_subdiv else ""
-    body += """
+    left_panel_content += """
     <div style="margin-top:12px;"><b>3) 人口（可留空自动查）</b></div>
     <input type="text" name="pop" placeholder="例如：100万、350000、0.35亿（留空自动查询）" value="{pop}" />
     <div style="margin-top:10px;">
@@ -256,6 +257,12 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
 
     selected_qid = qid_val or candidates[0].qid
     if not selected_qid:
+        body = f"""
+<div class="row">
+  <div style="flex:1;">{left_panel_content}</div>
+  <div style="flex:1;">{right_panel_content}</div>
+</div>
+"""
         return html_page("共享充电宝投放分析工具", body)
 
     entity = None
@@ -271,17 +278,35 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
         try:
             population = planner.parse_population(pop_val)
         except Exception as e:
-            body += f"<div class='card error'>人口解析失败：{escape(str(e))}</div>"
+            left_panel_content += f"<div class='card error'>人口解析失败：{escape(str(e))}</div>"
+            body = f"""
+<div class="row">
+  <div style="flex:1;">{left_panel_content}</div>
+  <div style="flex:1;">{right_panel_content}</div>
+</div>
+"""
             return html_page("共享充电宝投放分析工具", body)
     else:
         try:
             population = planner.wikidata_population(selected_qid)
         except Exception as e:
-            body += f"<div class='card error'>自动获取人口失败：{escape(str(e))}</div>"
+            left_panel_content += f"<div class='card error'>自动获取人口失败：{escape(str(e))}</div>"
+            body = f"""
+<div class="row">
+  <div style="flex:1;">{left_panel_content}</div>
+  <div style="flex:1;'>{right_panel_content}</div>
+</div>
+"""
             return html_page("共享充电宝投放分析工具", body)
 
     if population is None:
-        body += "<div class='card error'>无法自动获取该地区人口，请手动输入人口数。</div>"
+        left_panel_content += "<div class='card error'>无法自动获取该地区人口，请手动输入人口数。</div>"
+        body = f"""
+<div class="row">
+  <div style="flex:1;">{left_panel_content}</div>
+  <div style="flex:1;'>{right_panel_content}</div>
+</div>
+"""
         return html_page("共享充电宝投放分析工具", body)
 
     population_int = int(population)
@@ -349,7 +374,7 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
             max_len=60,
         )
 
-    body += f"""
+    left_panel_content += f"""
 <div class="card">
   <div class="ok"><b>测算结果</b></div>
   <div class="row" style="margin-top:10px;">
@@ -358,115 +383,35 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
     <div><b>代理名额</b><div>{escape(f"{plan.agent_slots:,}")}</div></div>
   </div>
   <div style="margin-top:12px;">{render_table(rows)}</div>
-  <div style="margin-top:12px;">
-    <a href="/report?qid={quote(selected_qid, safe='')}&name={quote(plan.name, safe='')}&pop={quote(str(plan.population), safe='')}">生成简报</a>
-  </div>
 </div>
 """
-    return html_page("共享充电宝投放分析工具", body)
+    report_content = ""
+    if selected_qid and plan.name and plan.population:
+        report_key = f"report:{selected_qid}:{plan.population}:{planner.PEOPLE_PER_CABINET}:{planner.CABINETS_PER_AGENT}"
+        if kv_is_configured():
+            cached = kv_get_text(report_key)
+            if cached:
+                report_content = cached
+        if not report_content:
+            entity = None
+            try:
+                entity = planner.wikidata_first_entity(selected_qid, language=planner.WIKIDATA_LANG)
+            except Exception:
+                entity = None
+            report_content = planner.build_area_report(plan=plan, qid=selected_qid, entity=entity)
+            if kv_is_configured() and report_content:
+                kv_set_text(report_key, report_content, ex_seconds=60 * 60 * 24 * 30)
 
-
-@app.get("/report", response_class=PlainTextResponse)
-def report(qid: str, name: str, pop: int):
-    qid = (qid or "").strip()
-    name = (name or "").strip()
-    pop = int(pop)
-    report_key = f"report:{qid}:{pop}:{planner.PEOPLE_PER_CABINET}:{planner.CABINETS_PER_AGENT}"
-    if kv_is_configured():
-        cached = kv_get_text(report_key)
-        if cached:
-            return cached
-    entity = None
-    try:
-        entity = planner.wikidata_first_entity(qid, language=planner.WIKIDATA_LANG)
-    except Exception:
-        entity = None
-    plan = planner.plan_for_area(name, pop)
-    text = planner.build_area_report(plan=plan, qid=qid, entity=entity)
-    if kv_is_configured() and text:
-        kv_set_text(report_key, text, ex_seconds=60 * 60 * 24 * 30)
-    return text
-
-
-@app.get("/csv", response_class=HTMLResponse)
-def csv_page():
-    body = """
+    right_panel_content = f"""
 <div class="card">
-  <form method="post" action="/csv" enctype="multipart/form-data">
-    <div><b>批量上传 CSV</b></div>
-    <div class="muted">需要包含列：name/地区/城市/名称 与 population/人口/人数（支持 万/亿）。</div>
-    <div style="margin-top:10px;">
-      <input type="file" name="file" accept=".csv,text/csv" />
-    </div>
-    <div style="margin-top:10px;">
-      <button type="submit" name="mode" value="view">查看结果</button>
-      <button class="secondary" type="submit" name="mode" value="download">下载 CSV</button>
-      <a style="margin-left:10px;" href="/">返回首页</a>
-    </div>
-  </form>
+  <div class="ok"><b>简报</b></div>
+  <pre style="margin-top:10px;">{escape(report_content)}</pre>
 </div>
 """
-    return html_page("CSV 批量处理", body)
-
-
-@app.post("/csv", response_class=HTMLResponse)
-def csv_compute(mode: str = Form("view"), file: UploadFile = File(...)):
-    rows = read_uploaded_csv(file)
-    if not rows:
-        return html_page("CSV 批量处理", "<div class='card error'>CSV 为空或无法解析。</div><a href='/csv'>返回</a>")
-
-    header = set(rows[0].keys())
-    name_key = next((k for k in header if str(k).lower() in {"name", "city", "area", "地区", "城市", "名称"}), None)
-    pop_key = next((k for k in header if str(k).lower() in {"population", "pop", "people", "人口", "人数"}), None)
-    if not name_key or not pop_key:
-        return html_page(
-            "CSV 批量处理",
-            "<div class='card error'>CSV 必须包含地区名称列和人口列。</div><a href='/csv'>返回</a>",
-        )
-
-    out: list[dict] = []
-    failed = 0
-    for r in rows:
-        name = str(r.get(name_key) or "").strip()
-        pop_raw = str(r.get(pop_key) or "").strip()
-        if not name and not pop_raw:
-            continue
-        try:
-            pop = planner.parse_population(pop_raw)
-            p = planner.plan_for_area(name, pop)
-            out.append(
-                {
-                    "地区": p.name,
-                    "人口(万)": f"{p.population / 10_000:.2f}",
-                    "柜机数": f"{p.cabinets_needed}",
-                    "代理名额": f"{p.agent_slots}",
-                }
-            )
-        except Exception:
-            failed += 1
-
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["地区", "人口(万)", "柜机数", "代理名额"])
-    writer.writeheader()
-    for item in out:
-        writer.writerow(item)
-    content = buf.getvalue().encode("utf-8-sig")
-    if (mode or "").strip().lower() == "download":
-        return Response(
-            content=content,
-            media_type="text/csv; charset=utf-8",
-            headers={"Content-Disposition": "attachment; filename=批量计算结果.csv"},
-        )
-
     body = f"""
-<div class="card">
-  <div class="ok"><b>批量结果</b></div>
-  <div class="muted">成功 {len(out)} 条，跳过 {failed} 条</div>
-  <div style="margin-top:12px;">{render_table(out[:200])}</div>
-  <div style="margin-top:12px;">
-    <a href="/csv">返回继续上传</a>
-    <a style="margin-left:10px;" href="/">返回首页</a>
-  </div>
+<div class="row">
+  <div style="flex:1;">{left_panel_content}</div>
+  <div style="flex:1;">{right_panel_content}</div>
 </div>
 """
-    return HTMLResponse(content=html_page("CSV 批量处理", body))
+    return html_page("共享充电宝投放分析工具", body, "display: flex; gap: 24px;")
