@@ -53,10 +53,12 @@ def get_api_connection_status() -> str:
       <div style="display: flex; gap: 20px; flex-wrap: wrap;">
         <div>高德行政区划: <span class="{'ok' if amap_is_configured() else 'error'}">{amap_status}</span></div>
         <div>缓存(Vercel KV/Upstash): <span class="{kv_mode['class']}">{kv_mode['text']}</span></div>
+      </div>
       <div class="muted" style="margin-top: 8px;">运行时环境变量：<code>{escape(probe_text)}</code></div>
-      <div class="muted" style="margin-top: 8px;">在 Vercel 控制台启用 Storage → KV 并绑定项目后，会自动注入 KV_REST_API_URL / KV_REST_API_TOKEN。</div>
+      <div class="muted" style="margin-top: 8px;">在 Vercel 控制台启用 Storage → Upstash → Redis 并绑定项目后，会自动注入 UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN。</div>
     </div>
     """
+    return status_html
 
 
 def html_page(title: str, body: str, main_content_style: str = "") -> str:
