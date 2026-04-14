@@ -4,6 +4,7 @@ import io
 import json
 import os
 import time
+from functools import lru_cache
 from html import escape
 from urllib.parse import quote
 
@@ -25,6 +26,11 @@ def kv_env_probe() -> dict[str, bool]:
         "KV_REST_API_URL",
         "KV_REST_API_TOKEN",
         "KV_REST_API_READ_ONLY_TOKEN",
+        "REDIS_URL",
+        "UPSTASH_REDIS_URL",
+        "REDIS_REST_URL",
+        "REDIS_REST_TOKEN",
+        "REDIS_REST_READ_ONLY_TOKEN",
         "UPSTASH_REDIS_REST_URL",
         "UPSTASH_REDIS_REST_TOKEN",
         "UPSTASH_REDIS_REST_READ_ONLY_TOKEN",
@@ -41,6 +47,9 @@ def get_api_connection_status() -> str:
             f"KV_URL={'是' if probe['KV_REST_API_URL'] else '否'}",
             f"KV_TOKEN={'是' if probe['KV_REST_API_TOKEN'] else '否'}",
             f"KV_RO={'是' if probe['KV_REST_API_READ_ONLY_TOKEN'] else '否'}",
+            f"REDIS_URL={'是' if probe['REDIS_URL'] else '否'}",
+            f"REDIS_REST_URL={'是' if probe['REDIS_REST_URL'] else '否'}",
+            f"REDIS_REST_TOKEN={'是' if probe['REDIS_REST_TOKEN'] else '否'}",
             f"UP_URL={'是' if probe['UPSTASH_REDIS_REST_URL'] else '否'}",
             f"UP_TOKEN={'是' if probe['UPSTASH_REDIS_REST_TOKEN'] else '否'}",
             f"UP_RO={'是' if probe['UPSTASH_REDIS_REST_READ_ONLY_TOKEN'] else '否'}",
@@ -117,7 +126,7 @@ def kv_is_configured() -> bool:
 
 
 def kv_rest_url() -> str:
-    for k in ("KV_REST_API_URL", "UPSTASH_REDIS_REST_URL"):
+    for k in ("KV_REST_API_URL", "REDIS_REST_URL", "UPSTASH_REDIS_REST_URL"):
         v = (os.getenv(k) or "").strip()
         if v:
             return v.rstrip("/")
@@ -125,7 +134,7 @@ def kv_rest_url() -> str:
 
 
 def kv_rest_write_token() -> str:
-    for k in ("KV_REST_API_TOKEN", "UPSTASH_REDIS_REST_TOKEN"):
+    for k in ("KV_REST_API_TOKEN", "REDIS_REST_TOKEN", "UPSTASH_REDIS_REST_TOKEN"):
         v = (os.getenv(k) or "").strip()
         if v:
             return v
@@ -135,8 +144,10 @@ def kv_rest_write_token() -> str:
 def kv_rest_read_token() -> str:
     for k in (
         "KV_REST_API_READ_ONLY_TOKEN",
+        "REDIS_REST_READ_ONLY_TOKEN",
         "UPSTASH_REDIS_REST_READ_ONLY_TOKEN",
         "KV_REST_API_TOKEN",
+        "REDIS_REST_TOKEN",
         "UPSTASH_REDIS_REST_TOKEN",
     ):
         v = (os.getenv(k) or "").strip()
@@ -146,14 +157,16 @@ def kv_rest_read_token() -> str:
 
 
 def kv_can_read() -> bool:
-    return bool(kv_rest_url()) and bool(kv_rest_read_token())
+    return (bool(kv_rest_url()) and bool(kv_rest_read_token())) or bool(kv_redis_url())
 
 
 def kv_can_write() -> bool:
-    return bool(kv_rest_url()) and bool(kv_rest_write_token())
+    return (bool(kv_rest_url()) and bool(kv_rest_write_token())) or bool(kv_redis_url())
 
 
 def kv_mode_text() -> dict[str, str]:
+    if kv_redis_url():
+        return {"text": "已配置(Redis URL)", "class": "ok"}
     if kv_can_write():
         return {"text": "已配置(读写)", "class": "ok"}
     if kv_can_read():
@@ -161,15 +174,73 @@ def kv_mode_text() -> dict[str, str]:
     return {"text": "未配置(可选)", "class": "muted"}
 
 
+def kv_redis_url() -> str:
+    for k in ("REDIS_URL", "UPSTASH_REDIS_URL"):
+        v = (os.getenv(k) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+@lru_cache(maxsize=1)
+def kv_redis_client():
+    url = kv_redis_url()
+    if not url:
+        return None
+    try:
+        import redis  # type: ignore
+    except Exception:
+        return None
+    try:
+        return redis.Redis.from_url(url, socket_timeout=3, socket_connect_timeout=3, retry_on_timeout=True)
+    except Exception:
+        return None
+
+
+
 def kv_call(command: str, *args: str, body: bytes | None = None, params: dict[str, str] | None = None) -> object | None:
     url = kv_rest_url()
-    token = kv_rest_read_token()
     if not url or not token:
+        client = kv_redis_client()
+        if client is None:
+            return None
+        cmd = command.strip().lower()
+        try:
+            if cmd == "get" and len(args) >= 1:
+                v = client.get(str(args[0]))
+                if v is None:
+                    return None
+                if isinstance(v, bytes):
+                    return v.decode("utf-8", errors="ignore")
+                return str(v)
+            if cmd == "set" and len(args) >= 1 and body is not None:
+                ex = None
+                if params and isinstance(params.get("EX"), str) and params["EX"].strip().isdigit():
+                    ex = int(params["EX"].strip())
+                ok = client.set(str(args[0]), body, ex=ex)
+                return "OK" if ok else None
+            if cmd == "lpush" and len(args) >= 1 and body is not None:
+                client.lpush(str(args[0]), body)
+                return 1
+            if cmd == "ltrim" and len(args) >= 3:
+                client.ltrim(str(args[0]), int(args[1]), int(args[2]))
+                return 1
+            if cmd == "lrange" and len(args) >= 3:
+                items = client.lrange(str(args[0]), int(args[1]), int(args[2]))
+                out: list[str] = []
+                for it in items:
+                    if isinstance(it, bytes):
+                        out.append(it.decode("utf-8", errors="ignore"))
+                    else:
+                        out.append(str(it))
+                return out
+        except Exception:
+            return None
+        return None
         return None
 
     path = "/".join([quote(command.strip().lower(), safe=""), *(quote(str(a), safe="") for a in args)])
     full_url = f"{url}/{path}"
-    headers = {"Authorization": f"Bearer {token}"}
     try:
         if body is None:
             resp = requests.get(full_url, headers=headers, params=params, timeout=6)
