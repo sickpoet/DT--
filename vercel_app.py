@@ -149,9 +149,184 @@ def kv_lrange_json(list_key: str, start: int, stop: int) -> list[object]:
     return out
 
 
+def amap_key() -> str | None:
+    for k in ("AMAP_KEY", "GAODE_KEY", "AMAP_WEB_KEY"):
+        v = (os.getenv(k) or "").strip()
+        if v:
+            return v
+    return None
+
+
+def amap_is_configured() -> bool:
+    return bool(amap_key())
+
+
+def amap_get_json(params: dict[str, str]) -> dict | None:
+    key = amap_key()
+    if not key:
+        return None
+    merged = dict(params)
+    merged["key"] = key
+    try:
+        resp = requests.get("https://restapi.amap.com/v3/config/district", params=merged, timeout=6)
+    except Exception:
+        return None
+    try:
+        payload = resp.json()
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("status") != "1":
+        return None
+    return payload
+
+
+def amap_district_search(keyword: str, limit: int = 10) -> list[dict[str, str]]:
+    kw = keyword.strip()
+    if not kw:
+        return []
+
+    cache_key = f"amap:district:search:{kw}:{limit}"
+    if kv_is_configured():
+        cached = kv_get_json(cache_key)
+        if isinstance(cached, list):
+            out: list[dict[str, str]] = []
+            for item in cached:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                adcode = str(item.get("adcode") or "").strip()
+                level = str(item.get("level") or "").strip()
+                if name and adcode:
+                    out.append({"name": name, "adcode": adcode, "level": level})
+            if out:
+                return out
+
+    payload = amap_get_json(
+        {
+            "keywords": kw,
+            "subdistrict": "0",
+            "extensions": "base",
+            "page": "1",
+            "offset": str(max(1, min(limit, 50))),
+        }
+    )
+    if not payload:
+        return []
+    districts = payload.get("districts")
+    if not isinstance(districts, list):
+        return []
+
+    out: list[dict[str, str]] = []
+    for d in districts:
+        if not isinstance(d, dict):
+            continue
+        name = str(d.get("name") or "").strip()
+        adcode = str(d.get("adcode") or "").strip()
+        level = str(d.get("level") or "").strip()
+        if name and adcode:
+            out.append({"name": name, "adcode": adcode, "level": level})
+        if len(out) >= limit:
+            break
+
+    if kv_is_configured() and out:
+        kv_set_json(cache_key, out, ex_seconds=60 * 60 * 24 * 7)
+    return out
+
+
+def amap_district_detail(adcode_or_keyword: str, subdistrict: int = 0) -> dict | None:
+    key = adcode_or_keyword.strip()
+    if not key:
+        return None
+
+    cache_key = f"amap:district:detail:{key}:{int(bool(subdistrict))}"
+    if kv_is_configured():
+        cached = kv_get_json(cache_key)
+        if isinstance(cached, dict) and str(cached.get("adcode") or "").strip():
+            return cached
+
+    payload = amap_get_json(
+        {
+            "keywords": key,
+            "subdistrict": "1" if subdistrict else "0",
+            "extensions": "base",
+            "page": "1",
+            "offset": "1",
+        }
+    )
+    if not payload:
+        return None
+    districts = payload.get("districts")
+    if not isinstance(districts, list) or not districts:
+        return None
+    d0 = districts[0]
+    if not isinstance(d0, dict):
+        return None
+    if kv_is_configured():
+        kv_set_json(cache_key, d0, ex_seconds=60 * 60 * 24 * 30)
+    return d0
+
+
+def pick_best_wikidata_qid(name: str, candidates: list[planner.WikidataCandidate]) -> str | None:
+    target = name.strip()
+    if not target or not candidates:
+        return None
+
+    best_qid: str | None = None
+    best_score = -1
+    for c in candidates:
+        label = (c.label or "").strip()
+        desc = (c.description or "").strip()
+        score = 0
+        if label == target:
+            score += 50
+        if "中国" in desc or "中华人民共和国" in desc:
+            score += 12
+        if any(k in desc for k in ("省", "市", "县", "区", "自治州", "地区", "乡", "镇", "街道")):
+            score += 8
+        if any(k in label for k in ("省", "市", "县", "区", "自治州", "地区", "乡", "镇", "街道")):
+            score += 4
+        if c.qid and c.qid.startswith("Q"):
+            score += 1
+        if score > best_score:
+            best_score = score
+            best_qid = c.qid
+    return best_qid
+
+
+def resolve_wikidata_qid_for_name(name: str) -> str | None:
+    target = name.strip()
+    if not target:
+        return None
+
+    cache_key = f"wikidata:resolve:{target}"
+    if kv_is_configured():
+        cached = kv_get_text(cache_key)
+        if isinstance(cached, str) and cached.startswith("Q"):
+            return cached
+
+    try:
+        candidates = planner.wikidata_search(target, limit=12, language="zh")
+    except Exception:
+        candidates = []
+
+    qid = pick_best_wikidata_qid(target, candidates)
+    if kv_is_configured() and qid and qid.startswith("Q"):
+        kv_set_text(cache_key, qid, ex_seconds=60 * 60 * 24 * 30)
+    return qid
+
+
 @app.get("/", response_class=HTMLResponse)
-def home(query: str | None = None, qid: str | None = None, pop: str | None = None, include_subdiv: int = 0):
+def home(
+    query: str | None = None,
+    code: str | None = None,
+    qid: str | None = None,
+    pop: str | None = None,
+    include_subdiv: int = 0,
+):
     query_val = (query or "").strip()
+    code_val = (code or "").strip()
     qid_val = (qid or "").strip()
     pop_val = (pop or "").strip()
     include_subdiv = 1 if include_subdiv else 0
@@ -176,17 +351,22 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
                     if not isinstance(it, dict):
                         continue
                     item_qid = str(it.get("qid") or "").strip()
+                    item_code = str(it.get("code") or "").strip()
                     item_name = str(it.get("name") or "").strip()
                     item_pop = it.get("population")
-                    if not item_qid or not item_name:
+                    if not item_name or (not item_qid and not item_code):
                         continue
                     if isinstance(item_pop, int) and item_pop > 0:
                         pop_param = f"&pop={quote(str(item_pop), safe='')}"
                     else:
                         pop_param = ""
+                    if item_code:
+                        id_param = f"&code={quote(item_code, safe='')}"
+                    else:
+                        id_param = f"&qid={quote(item_qid, safe='')}"
                     links.append(
-                        f"<div><a href='/?query={quote(item_name, safe='')}&qid={quote(item_qid, safe='')}{pop_param}'>"
-                        f"{escape(item_name)} <span class='muted'>({escape(item_qid)})</span>"
+                        f"<div><a href='/?query={quote(item_name, safe='')}{id_param}{pop_param}'>"
+                        f"{escape(item_name)} <span class='muted'>({escape(item_code or item_qid)})</span>"
                         f"</a></div>"
                     )
                 if links:
@@ -199,29 +379,37 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
 """
         return html_page("共享充电宝投放分析工具", body)
 
-    candidates = []
+    amap_candidates: list[dict[str, str]] = []
+    wikidata_candidates: list[planner.WikidataCandidate] = []
     error = ""
-    try:
-        candidates = planner.wikidata_search(query_val, limit=10, language="zh")
-    except Exception as e:
-        error = str(e)
+    prefer_wikidata = bool(qid_val.startswith("Q") and not code_val)
+    if amap_is_configured() and not prefer_wikidata:
+        try:
+            amap_candidates = amap_district_search(query_val, limit=10)
+        except Exception:
+            amap_candidates = []
+    if not amap_candidates:
+        try:
+            wikidata_candidates = planner.wikidata_search(query_val, limit=10, language="zh")
+        except Exception as e:
+            error = str(e)
 
     if error:
         left_panel_content += f"<div class='card error'>联网搜索失败：{escape(error)}</div>"
         body = f"""
 <div class="row">
   <div style="flex:1;">{left_panel_content}</div>
-  <div style="flex:1;'>{right_panel_content}</div>
+  <div style="flex:1;">{right_panel_content}</div>
 </div>
 """
         return html_page("共享充电宝投放分析工具", body)
 
-    if not candidates:
+    if not amap_candidates and not wikidata_candidates:
         left_panel_content += "<div class='card muted'>未找到匹配项，请换个关键词再试。</div>"
         body = f"""
 <div class="row">
   <div style="flex:1;">{left_panel_content}</div>
-  <div style="flex:1;'>{right_panel_content}</div>
+  <div style="flex:1;">{right_panel_content}</div>
 </div>
 """
         return html_page("共享充电宝投放分析工具", body)
@@ -233,15 +421,32 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
     <input type="hidden" name="query" value="{query}" />
 """.format(query=escape(query_val))
 
-    for idx, c in enumerate(candidates):
-        checked = "checked" if (qid_val and c.qid == qid_val) or (not qid_val and idx == 0) else ""
-        desc = f" - {c.description}" if c.description else ""
-        left_panel_content += (
-            f"<label style='display:block;margin:8px 0;'>"
-            f"<input type='radio' name='qid' value='{escape(c.qid)}' {checked} /> "
-            f"{escape(c.label)}{escape(desc)} <span class='muted'>({escape(c.qid)})</span>"
-            f"</label>"
-        )
+    selection_mode = "wikidata" if prefer_wikidata else ("amap" if amap_candidates else "wikidata")
+    if selection_mode == "amap":
+        for idx, c in enumerate(amap_candidates):
+            adcode = str(c.get("adcode") or "").strip()
+            name = str(c.get("name") or "").strip()
+            level = str(c.get("level") or "").strip()
+            if not adcode or not name:
+                continue
+            checked = "checked" if (code_val and adcode == code_val) or (not code_val and idx == 0) else ""
+            level_text = f"{escape(level)} / " if level else ""
+            left_panel_content += (
+                f"<label style='display:block;margin:8px 0;'>"
+                f"<input type='radio' name='code' value='{escape(adcode)}' {checked} /> "
+                f"{escape(name)} <span class='muted'>({level_text}{escape(adcode)})</span>"
+                f"</label>"
+            )
+    else:
+        for idx, c in enumerate(wikidata_candidates):
+            checked = "checked" if (qid_val and c.qid == qid_val) or (not qid_val and idx == 0) else ""
+            desc = f" - {c.description}" if c.description else ""
+            left_panel_content += (
+                f"<label style='display:block;margin:8px 0;'>"
+                f"<input type='radio' name='qid' value='{escape(c.qid)}' {checked} /> "
+                f"{escape(c.label)}{escape(desc)} <span class='muted'>({escape(c.qid)})</span>"
+                f"</label>"
+            )
 
     checked = "checked" if include_subdiv else ""
     left_panel_content += """
@@ -255,23 +460,32 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
 </div>
 """.format(pop=escape(pop_val), checked=checked)
 
-    selected_qid = qid_val or candidates[0].qid
-    if not selected_qid:
-        body = f"""
+    selected_code = ""
+    selected_qid = ""
+    selected_name = query_val
+    resolved_qid: str | None = None
+    if selection_mode == "amap":
+        selected_code = code_val or str(amap_candidates[0].get("adcode") or "").strip()
+        if not selected_code:
+            body = f"""
 <div class="row">
   <div style="flex:1;">{left_panel_content}</div>
   <div style="flex:1;">{right_panel_content}</div>
 </div>
 """
-        return html_page("共享充电宝投放分析工具", body)
-
-    entity = None
-    try:
-        entity = planner.wikidata_first_entity(selected_qid, language=planner.WIKIDATA_LANG)
-    except Exception:
-        entity = None
-
-    name = (entity.label if entity and entity.label else query_val).strip() or query_val
+            return html_page("共享充电宝投放分析工具", body)
+        detail = amap_district_detail(selected_code, subdistrict=1 if include_subdiv else 0) or {}
+        selected_name = str(detail.get("name") or query_val).strip() or query_val
+        if qid_val.startswith("Q"):
+            resolved_qid = qid_val
+        else:
+            resolved_qid = resolve_wikidata_qid_for_name(selected_name)
+        if resolved_qid:
+            selected_qid = resolved_qid
+    else:
+        selected_qid = qid_val or wikidata_candidates[0].qid
+        resolved_qid = selected_qid if selected_qid.startswith("Q") else None
+        selected_name = query_val
 
     population: int | None = None
     if pop_val:
@@ -287,44 +501,56 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
 """
             return html_page("共享充电宝投放分析工具", body)
     else:
-        try:
-            population = planner.wikidata_population(selected_qid)
-        except Exception as e:
-            left_panel_content += f"<div class='card error'>自动获取人口失败：{escape(str(e))}</div>"
-            body = f"""
+        if resolved_qid:
+            try:
+                population = planner.wikidata_population(resolved_qid)
+            except Exception as e:
+                left_panel_content += f"<div class='card error'>自动获取人口失败：{escape(str(e))}</div>"
+                body = f"""
 <div class="row">
   <div style="flex:1;">{left_panel_content}</div>
-  <div style="flex:1;'>{right_panel_content}</div>
+  <div style="flex:1;">{right_panel_content}</div>
 </div>
 """
-            return html_page("共享充电宝投放分析工具", body)
+                return html_page("共享充电宝投放分析工具", body)
 
     if population is None:
-        left_panel_content += "<div class='card error'>无法自动获取该地区人口，请手动输入人口数。</div>"
+        if selection_mode == "amap" and not resolved_qid:
+            left_panel_content += "<div class='card error'>已从高德获取行政区划，但未匹配到可用的人口来源，请手动输入人口数。</div>"
+        else:
+            left_panel_content += "<div class='card error'>无法自动获取该地区人口，请手动输入人口数。</div>"
         body = f"""
 <div class="row">
   <div style="flex:1;">{left_panel_content}</div>
-  <div style="flex:1;'>{right_panel_content}</div>
+  <div style="flex:1;">{right_panel_content}</div>
 </div>
 """
         return html_page("共享充电宝投放分析工具", body)
 
     population_int = int(population)
-    cache_key = f"calc:{selected_qid}:{population_int}:{planner.PEOPLE_PER_CABINET}:{planner.CABINETS_PER_AGENT}"
+    calc_id = selected_qid if selected_qid else f"code:{selected_code}"
+    cache_key = f"calc:{calc_id}:{population_int}:{planner.PEOPLE_PER_CABINET}:{planner.CABINETS_PER_AGENT}"
     cached = kv_get_json(cache_key) if kv_is_configured() else None
-    if isinstance(cached, dict) and cached.get("qid") == selected_qid and cached.get("population") == population_int:
-        plan = planner.plan_for_area(str(cached.get("name") or name), population_int)
+    if isinstance(cached, dict) and cached.get("id") == calc_id and cached.get("population") == population_int:
+        plan = planner.plan_for_area(str(cached.get("name") or selected_name), population_int)
     else:
-        plan = planner.plan_for_area(name, population_int)
+        plan = planner.plan_for_area(selected_name, population_int)
     rows = [
         {
             "地区": plan.name,
             "人口(万)": f"{plan.population / 10_000:.2f}",
             "柜机数": f"{plan.cabinets_needed}",
             "代理名额": f"{plan.agent_slots}",
-            "_qid": selected_qid,
+            "_qid": selected_qid or selected_code,
         }
     ]
+
+    entity = None
+    if resolved_qid:
+        try:
+            entity = planner.wikidata_first_entity(resolved_qid, language=planner.WIKIDATA_LANG)
+        except Exception:
+            entity = None
 
     if include_subdiv and entity:
         try:
@@ -355,7 +581,9 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
         kv_set_json(
             cache_key,
             {
+                "id": calc_id,
                 "qid": selected_qid,
+                "code": selected_code,
                 "name": plan.name,
                 "population": plan.population,
                 "cabinets": plan.cabinets_needed,
@@ -369,7 +597,7 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
         )
         kv_lpush_json(
             "history:queries",
-            {"qid": selected_qid, "name": plan.name, "population": plan.population, "ts": ts},
+            {"qid": selected_qid, "code": selected_code, "name": plan.name, "population": plan.population, "ts": ts},
             max_len=60,
         )
 
@@ -385,19 +613,15 @@ def home(query: str | None = None, qid: str | None = None, pop: str | None = Non
 </div>
 """
     report_content = ""
-    if selected_qid and plan.name and plan.population:
-        report_key = f"report:{selected_qid}:{plan.population}:{planner.PEOPLE_PER_CABINET}:{planner.CABINETS_PER_AGENT}"
+    report_qid = selected_qid or None
+    if report_qid and plan.name and plan.population:
+        report_key = f"report:{report_qid}:{plan.population}:{planner.PEOPLE_PER_CABINET}:{planner.CABINETS_PER_AGENT}"
         if kv_is_configured():
             cached = kv_get_text(report_key)
             if cached:
                 report_content = cached
         if not report_content:
-            entity = None
-            try:
-                entity = planner.wikidata_first_entity(selected_qid, language=planner.WIKIDATA_LANG)
-            except Exception:
-                entity = None
-            report_content = planner.build_area_report(plan=plan, qid=selected_qid, entity=entity)
+            report_content = planner.build_area_report(plan=plan, qid=report_qid, entity=entity)
             if kv_is_configured() and report_content:
                 kv_set_text(report_key, report_content, ex_seconds=60 * 60 * 24 * 30)
 
