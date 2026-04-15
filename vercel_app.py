@@ -200,6 +200,7 @@ def kv_redis_client():
 
 def kv_call(command: str, *args: str, body: bytes | None = None, params: dict[str, str] | None = None) -> object | None:
     url = kv_rest_url()
+    token = kv_rest_read_token()
     if not url or not token:
         client = kv_redis_client()
         if client is None:
@@ -237,10 +238,10 @@ def kv_call(command: str, *args: str, body: bytes | None = None, params: dict[st
         except Exception:
             return None
         return None
-        return None
 
     path = "/".join([quote(command.strip().lower(), safe=""), *(quote(str(a), safe="") for a in args)])
     full_url = f"{url}/{path}"
+    headers = {"Authorization": f"Bearer {token}"}
     try:
         if body is None:
             resp = requests.get(full_url, headers=headers, params=params, timeout=6)
@@ -699,7 +700,7 @@ def home(
             items = kv_lrange_json("history:queries", 0, 9)
             if items:
                 links: list[str] = []
-                seen: set[tuple[str, str, str, int | None]] = set()
+                seen: set[tuple[str, str]] = set()
                 for it in items:
                     if not isinstance(it, dict):
                         continue
@@ -709,8 +710,8 @@ def home(
                     item_pop = it.get("population")
                     if not item_name or (not item_qid and not item_code):
                         continue
-                    pop_key = int(item_pop) if isinstance(item_pop, int) else None
-                    dedup_key = (item_qid, item_code, item_name, pop_key)
+                    identity = item_code or item_qid
+                    dedup_key = (identity, item_name)
                     if dedup_key in seen:
                         continue
                     seen.add(dedup_key)
