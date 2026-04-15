@@ -480,7 +480,7 @@ def amap_build_poi_section(city: str) -> str:
         ("写字楼", "写字楼"),
     ]
     lines: list[str] = []
-    lines.append("四、POI 概览（高德）")
+    lines.append("（高德）POI 概览")
     ok_any = False
     for label, kw in items:
         cnt = amap_poi_count(city_val, kw)
@@ -496,6 +496,27 @@ def amap_build_poi_section(city: str) -> str:
         return ""
     lines.append("")
     return "\n".join(lines)
+
+
+def insert_poi_after_section3(report: str, poi_section: str) -> str:
+    base = (report or "").strip()
+    poi = (poi_section or "").strip()
+    if not poi:
+        return report
+    if not base:
+        return poi + "\n"
+
+    marker = "\n四、投放建议"
+    idx = base.find(marker)
+    if idx == -1:
+        marker = "\n五、核心板块拆解"
+        idx = base.find(marker)
+    if idx == -1:
+        return base.rstrip() + "\n\n" + poi + "\n"
+
+    before = base[:idx].rstrip()
+    after = base[idx:].lstrip()
+    return before + "\n\n" + poi + "\n\n" + after + "\n"
 
 
 def amap_district_search(keyword: str, limit: int = 10) -> list[dict[str, str]]:
@@ -678,6 +699,7 @@ def home(
             items = kv_lrange_json("history:queries", 0, 9)
             if items:
                 links: list[str] = []
+                seen: set[tuple[str, str, str, int | None]] = set()
                 for it in items:
                     if not isinstance(it, dict):
                         continue
@@ -687,6 +709,11 @@ def home(
                     item_pop = it.get("population")
                     if not item_name or (not item_qid and not item_code):
                         continue
+                    pop_key = int(item_pop) if isinstance(item_pop, int) else None
+                    dedup_key = (item_qid, item_code, item_name, pop_key)
+                    if dedup_key in seen:
+                        continue
+                    seen.add(dedup_key)
                     if isinstance(item_pop, int) and item_pop > 0:
                         pop_param = f"&pop={quote(str(item_pop), safe='')}"
                     else:
@@ -947,11 +974,28 @@ def home(
             },
             ex_seconds=60 * 60 * 24 * 30,
         )
-        kv_lpush_json(
-            "history:queries",
-            {"qid": selected_qid, "code": selected_code, "name": plan.name, "population": plan.population, "ts": ts},
-            max_len=60,
-        )
+        newest = kv_lrange_json("history:queries", 0, 0)
+        should_push = True
+        if newest and isinstance(newest[0], dict):
+            prev = newest[0]
+            prev_qid = str(prev.get("qid") or "").strip()
+            prev_code = str(prev.get("code") or "").strip()
+            prev_name = str(prev.get("name") or "").strip()
+            prev_pop = prev.get("population")
+            if (
+                prev_qid == str(selected_qid or "").strip()
+                and prev_code == str(selected_code or "").strip()
+                and prev_name == str(plan.name or "").strip()
+                and isinstance(prev_pop, int)
+                and prev_pop == int(plan.population)
+            ):
+                should_push = False
+        if should_push:
+            kv_lpush_json(
+                "history:queries",
+                {"qid": selected_qid, "code": selected_code, "name": plan.name, "population": plan.population, "ts": ts},
+                max_len=60,
+            )
 
     left_panel_content += f"""
 <div class="card">
@@ -978,7 +1022,7 @@ def home(
         if not report_content:
             report_content = planner.build_area_report(plan=plan, qid=report_qid, entity=entity)
             if poi_section:
-                report_content = (report_content.rstrip() + "\n\n" + poi_section).strip() + "\n"
+                report_content = insert_poi_after_section3(report_content, poi_section)
             if kv_is_configured() and report_content:
                 kv_set_text(report_key, report_content, ex_seconds=60 * 60 * 24 * 30)
     else:
