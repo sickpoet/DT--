@@ -8,7 +8,7 @@ from functools import lru_cache
 from html import escape
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 
 import charger_cabinet_planner as planner
@@ -356,6 +356,93 @@ def amap_get_json(params: dict[str, str]) -> dict | None:
     return payload
 
 
+def amap_get_poi_json(params: dict[str, str]) -> dict | None:
+    key = amap_key()
+    if not key:
+        return None
+    merged = dict(params)
+    merged["key"] = key
+    try:
+        resp = requests.get("https://restapi.amap.com/v3/place/text", params=merged, timeout=6)
+    except Exception:
+        return None
+    try:
+        payload = resp.json()
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("status") != "1":
+        return None
+    return payload
+
+
+def amap_poi_count(city: str, keyword: str) -> int | None:
+    city_val = city.strip()
+    kw_val = keyword.strip()
+    if not city_val or not kw_val:
+        return None
+
+    cache_key = f"amap:poi:count:{city_val}:{kw_val}"
+    if kv_is_configured():
+        cached = kv_get_json(cache_key)
+        if isinstance(cached, dict) and isinstance(cached.get("count"), int):
+            return int(cached["count"])
+
+    payload = amap_get_poi_json(
+        {
+            "keywords": kw_val,
+            "city": city_val,
+            "citylimit": "true",
+            "children": "0",
+            "offset": "1",
+            "page": "1",
+            "extensions": "base",
+        }
+    )
+    if not payload:
+        return None
+    count_raw = payload.get("count")
+    try:
+        count = int(str(count_raw or "0").strip())
+    except Exception:
+        count = 0
+    if kv_is_configured():
+        kv_set_json(cache_key, {"count": count}, ex_seconds=60 * 60 * 24 * 14)
+    return count
+
+
+def amap_build_poi_section(city: str) -> str:
+    if not amap_is_configured():
+        return ""
+    city_val = city.strip()
+    if not city_val:
+        return ""
+
+    items = [
+        ("商场/购物中心", "商场"),
+        ("餐饮", "餐厅"),
+        ("医院", "医院"),
+        ("学校", "学校"),
+        ("地铁站", "地铁站"),
+        ("景点", "景区"),
+        ("写字楼", "写字楼"),
+    ]
+    lines: list[str] = []
+    lines.append("四、POI 概览（高德）")
+    ok_any = False
+    for label, kw in items:
+        cnt = amap_poi_count(city_val, kw)
+        if cnt is None:
+            continue
+        ok_any = True
+        lines.append(f"- {label}：{cnt:,}")
+    if not ok_any:
+        return ""
+    lines.append("")
+    return "\n".join(lines)
+
+
 def amap_district_search(keyword: str, limit: int = 10) -> list[dict[str, str]]:
     kw = keyword.strip()
     if not kw:
@@ -491,8 +578,22 @@ def resolve_wikidata_qid_for_name(name: str) -> str | None:
     return qid
 
 
+def is_county_level_amap(level: str) -> bool:
+    lv = (level or "").strip().lower()
+    return lv in {"district", "street"}
+
+
+def is_county_level_wikidata(label: str, description: str) -> bool:
+    text = f"{label} {description}".strip()
+    if not text:
+        return False
+    markers = ["自治县", "县级市", "市辖区", "旗", "自治旗", "林区", "县", "区"]
+    return any(m in text for m in markers)
+
+
 @app.get("/", response_class=HTMLResponse)
 def home(
+    request: Request,
     query: str | None = None,
     code: str | None = None,
     qid: str | None = None,
@@ -503,7 +604,8 @@ def home(
     code_val = (code or "").strip()
     qid_val = (qid or "").strip()
     pop_val = (pop or "").strip()
-    include_subdiv = 1 if include_subdiv else 0
+    include_subdiv_raw = 1 if include_subdiv else 0
+    include_subdiv_provided = "include_subdiv" in request.query_params
 
     left_panel_content = """
 <div class="card">
@@ -596,6 +698,26 @@ def home(
 """.format(query=escape(query_val))
 
     selection_mode = "wikidata" if prefer_wikidata else ("amap" if amap_candidates else "wikidata")
+    default_include_subdiv = 1
+    if selection_mode == "amap":
+        selected = None
+        if code_val:
+            selected = next((c for c in amap_candidates if str(c.get("adcode") or "").strip() == code_val), None)
+        if selected is None and amap_candidates:
+            selected = amap_candidates[0]
+        level = str((selected or {}).get("level") or "").strip()
+        default_include_subdiv = 0 if is_county_level_amap(level) else 1
+    else:
+        selected = None
+        if qid_val:
+            selected = next((c for c in wikidata_candidates if c.qid == qid_val), None)
+        if selected is None and wikidata_candidates:
+            selected = wikidata_candidates[0]
+        label = (selected.label if selected else "").strip()
+        desc = (selected.description if selected else "").strip()
+        default_include_subdiv = 0 if is_county_level_wikidata(label, desc) else 1
+
+    include_subdiv_effective = include_subdiv_raw if include_subdiv_provided else default_include_subdiv
     if selection_mode == "amap":
         for idx, c in enumerate(amap_candidates):
             adcode = str(c.get("adcode") or "").strip()
@@ -622,11 +744,12 @@ def home(
                 f"</label>"
             )
 
-    checked = "checked" if include_subdiv else ""
+    checked = "checked" if include_subdiv_effective else ""
     left_panel_content += """
     <div style="margin-top:12px;"><b>3) 人口（可留空自动查）</b></div>
     <input type="text" name="pop" placeholder="例如：100万、350000、0.35亿（留空自动查询）" value="{pop}" />
     <div style="margin-top:10px;">
+      <input type="hidden" name="include_subdiv" value="0" />
       <label><input type="checkbox" name="include_subdiv" value="1" {checked} /> 拉取下一级行政区划（可能较慢）</label>
     </div>
     <div style="margin-top:10px;"><button type="submit">开始测算</button></div>
@@ -648,7 +771,7 @@ def home(
 </div>
 """
             return html_page("共享充电宝投放分析工具", body)
-        detail = amap_district_detail(selected_code, subdistrict=1 if include_subdiv else 0) or {}
+        detail = amap_district_detail(selected_code, subdistrict=1 if include_subdiv_effective else 0) or {}
         selected_name = str(detail.get("name") or query_val).strip() or query_val
         if qid_val.startswith("Q"):
             resolved_qid = qid_val
@@ -726,7 +849,7 @@ def home(
         except Exception:
             entity = None
 
-    if include_subdiv and entity:
+    if include_subdiv_effective and entity:
         try:
             children = planner.wikidata_entity_list_qids_labels(entity, "P150", limit=40)
         except Exception:
@@ -764,7 +887,7 @@ def home(
                 "agents": plan.agent_slots,
                 "people_per_cabinet": planner.PEOPLE_PER_CABINET,
                 "cabinets_per_agent": planner.CABINETS_PER_AGENT,
-                "include_subdiv": include_subdiv,
+                "include_subdiv": include_subdiv_effective,
                 "ts": ts,
             },
             ex_seconds=60 * 60 * 24 * 30,
@@ -788,16 +911,24 @@ def home(
 """
     report_content = ""
     report_qid = selected_qid or None
+    poi_city = selected_code or selected_name
+    poi_section = amap_build_poi_section(poi_city) if poi_city else ""
+
     if report_qid and plan.name and plan.population:
-        report_key = f"report:{report_qid}:{plan.population}:{planner.PEOPLE_PER_CABINET}:{planner.CABINETS_PER_AGENT}"
+        report_key = f"report:v2:{report_qid}:{selected_code}:{plan.population}:{planner.PEOPLE_PER_CABINET}:{planner.CABINETS_PER_AGENT}"
         if kv_is_configured():
             cached = kv_get_text(report_key)
             if cached:
                 report_content = cached
         if not report_content:
             report_content = planner.build_area_report(plan=plan, qid=report_qid, entity=entity)
+            if poi_section:
+                report_content = (report_content.rstrip() + "\n\n" + poi_section).strip() + "\n"
             if kv_is_configured() and report_content:
                 kv_set_text(report_key, report_content, ex_seconds=60 * 60 * 24 * 30)
+    else:
+        if poi_section:
+            report_content = poi_section
 
     right_panel_content = f"""
 <div class="card">
