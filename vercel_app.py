@@ -412,6 +412,57 @@ def amap_poi_count(city: str, keyword: str) -> int | None:
     return count
 
 
+def amap_poi_samples(city: str, keyword: str, limit: int = 3) -> list[str]:
+    city_val = city.strip()
+    kw_val = keyword.strip()
+    limit = max(1, min(int(limit), 10))
+    if not city_val or not kw_val:
+        return []
+
+    cache_key = f"amap:poi:samples:{city_val}:{kw_val}:{limit}"
+    if kv_is_configured():
+        cached = kv_get_json(cache_key)
+        if isinstance(cached, list):
+            out: list[str] = []
+            for it in cached:
+                s = str(it or "").strip()
+                if s:
+                    out.append(s)
+            if out:
+                return out[:limit]
+
+    payload = amap_get_poi_json(
+        {
+            "keywords": kw_val,
+            "city": city_val,
+            "citylimit": "true",
+            "children": "0",
+            "offset": str(limit),
+            "page": "1",
+            "extensions": "base",
+        }
+    )
+    if not payload:
+        return []
+    pois = payload.get("pois")
+    if not isinstance(pois, list) or not pois:
+        return []
+
+    out: list[str] = []
+    for p in pois:
+        if not isinstance(p, dict):
+            continue
+        name = str(p.get("name") or "").strip()
+        if name:
+            out.append(name)
+        if len(out) >= limit:
+            break
+
+    if kv_is_configured() and out:
+        kv_set_json(cache_key, out, ex_seconds=60 * 60 * 24 * 14)
+    return out
+
+
 def amap_build_poi_section(city: str) -> str:
     if not amap_is_configured():
         return ""
@@ -436,7 +487,11 @@ def amap_build_poi_section(city: str) -> str:
         if cnt is None:
             continue
         ok_any = True
-        lines.append(f"- {label}：{cnt:,}")
+        samples = amap_poi_samples(city_val, kw, limit=3)
+        if samples:
+            lines.append(f"- {label}：{cnt:,}（例如：{'、'.join(samples)}）")
+        else:
+            lines.append(f"- {label}：{cnt:,}")
     if not ok_any:
         return ""
     lines.append("")
